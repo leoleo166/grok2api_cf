@@ -2,11 +2,15 @@
 
 这个仓库已经新增 **Cloudflare Workers / Pages** 可部署版本（TypeScript）。
 
+> 一键部署前置条件：若使用 GitHub Actions 工作流，请先在仓库 Secrets 配置 `CLOUDFLARE_API_TOKEN` 与 `CLOUDFLARE_ACCOUNT_ID`。  
+> Docker 一键启动入口仍是 `docker compose up -d`，请参考 `readme.md`。
+
 ## 功能概览
 
 - **D1（SQLite）**：持久化 Tokens / API Keys / 管理员会话 / 配置 / 日志
 - **KV**：缓存 `/images/*` 的图片/视频资源（从 `assets.grok.com` 代理抓取）
 - **每天 0 点统一清除**：通过 KV `expiration` + Workers Cron 定时清理元数据（`wrangler.toml` 已配置，默认按北京时间 00:00）
+- **前端移动端适配一致生效**：Workers 与 FastAPI/Docker 复用同一套 `/static/*` 资源，包含手机端抽屉导航、表格横向滚动、API Key 居中悬浮新增弹窗等交互
 
 > 原 Python/FastAPI 版本仍保留用于本地/Docker；Cloudflare 部署请按本文件走 Worker 版本。
 
@@ -139,6 +143,11 @@ python scripts/smoke_test.py --base-url https://<你的域名或workers.dev>
 3. `wrangler d1 migrations apply DB --remote --config wrangler.ci.toml`
 4. `wrangler deploy`
 
+触发策略保持不变：
+- `push` 到 `main`：自动触发 Cloudflare 部署作业
+- `workflow_dispatch`：可手动选择 `cloudflare/docker/both`
+- `v*` tag：用于 Docker 构建发布链路
+
 你需要在 GitHub 仓库里配置 Secrets（Settings → Secrets and variables → Actions）：
 
 - `CLOUDFLARE_API_TOKEN`
@@ -189,6 +198,19 @@ python scripts/smoke_test.py --base-url https://<你的域名或workers.dev>
 - 注意：KV 单条数据有大小限制（建议 ≤ 25MB），且大多数视频播放器会发起 Range 请求；Range 场景会直接代理上游，不一定会命中 KV 缓存。
 - 管理后台 API：`/api/*`（用于管理页）
 
+### 8.1) 管理后台 API 兼容语义（与 FastAPI 一致）
+
+- `GET /api/v1/admin/tokens` 返回项新增（增量兼容）：
+  - `token_type`
+  - `quota_known`
+  - `heavy_quota`
+  - `heavy_quota_known`
+- `POST /api/v1/admin/keys/update`：
+  - 当 key 不存在时返回 `404`
+- 额度语义：
+  - `remaining_queries = -1` 表示额度未知（unknown quota semantics）
+  - 前端应结合 `quota_known` / `heavy_quota_known` 判断，不应将未知额度直接判定为“额度用尽”
+
 ---
 
 ## 9) 部署到 Pages（可选，但不推荐用于“定时清理”）
@@ -224,3 +246,25 @@ region = "aws:us-east-1"
 
 如需调整：把 `region` 改成你想要的区域（例如 `aws:us-west-2`）。
 如需关闭：删除 `wrangler.toml` 中的 `[placement]` 段落即可（恢复默认的边缘就近执行）。
+
+---
+
+## 11) 发布后验证（建议）
+
+部署后可执行以下最小检查：
+
+1. 基础健康与登录页：
+   - `GET /health`
+   - `GET /login`
+2. 管理页可访问性：
+   - `GET /admin/token`
+   - `GET /admin/keys`
+3. 移动端回归（建议使用 `390x844`）：
+   - `/admin/keys`：点击“新增 Key”后应为居中悬浮弹窗（有遮罩，可点遮罩关闭，可 `Esc` 关闭）
+   - 顶部导航：手机端应为抽屉菜单（可打开/关闭，点击菜单项后自动收起）
+   - Token/Keys/Cache 表格：应保持横向滚动，不应压碎列布局
+4. 可选 smoke test：
+
+```bash
+python scripts/smoke_test.py --base-url https://<你的域名或workers.dev>
+```

@@ -237,7 +237,8 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
       if (typeof appCfg.admin_username === "string") global_config.admin_username = appCfg.admin_username.trim() || "admin";
       if (typeof appCfg.app_key === "string") global_config.admin_password = appCfg.app_key.trim() || "admin";
       if (typeof appCfg.app_url === "string") global_config.base_url = appCfg.app_url.trim();
-      if (appCfg.image_format === "url" || appCfg.image_format === "base64") global_config.image_mode = appCfg.image_format;
+      if (appCfg.image_format === "url" || appCfg.image_format === "base64" || appCfg.image_format === "b64_json")
+        global_config.image_mode = appCfg.image_format;
     }
 
     if (grokCfg && typeof grokCfg === "object") {
@@ -306,12 +307,19 @@ adminRoutes.get("/api/v1/admin/tokens", requireAdminAuth, async (c) => {
       const pool = toPoolName(r.token_type);
       const isCooling = Boolean(r.cooldown_until && r.cooldown_until > now);
       const status = r.status === "expired" ? "invalid" : isCooling ? "cooling" : "active";
-      const quotaRaw = r.remaining_queries;
-      const quota = quotaRaw >= 0 ? quotaRaw : 0;
+      const quotaKnown = Number.isFinite(r.remaining_queries) && r.remaining_queries >= 0;
+      const quota = quotaKnown ? r.remaining_queries : -1;
+      const heavyQuotaKnown =
+        r.token_type === "ssoSuper" && Number.isFinite(r.heavy_remaining_queries) && r.heavy_remaining_queries >= 0;
+      const heavyQuota = heavyQuotaKnown ? r.heavy_remaining_queries : -1;
       out[pool].push({
         token: `sso=${r.token}`,
         status,
         quota,
+        quota_known: quotaKnown,
+        heavy_quota: heavyQuota,
+        heavy_quota_known: heavyQuotaKnown,
+        token_type: r.token_type,
         note: r.note ?? "",
         fail_count: r.failed_count ?? 0,
         use_count: 0,
@@ -355,13 +363,18 @@ adminRoutes.post("/api/v1/admin/tokens", requireAdminAuth, async (c) => {
         const statusRaw = typeof it === "string" ? "active" : String((it as any)?.status ?? "active");
         const quotaRaw = typeof it === "string" ? 0 : Number((it as any)?.quota ?? 0);
         const quota = Number.isFinite(quotaRaw) && quotaRaw >= 0 ? Math.floor(quotaRaw) : -1;
+        const heavyQuotaRaw =
+          typeof it === "string"
+            ? -1
+            : Number((it as any)?.heavy_quota ?? (tokenType === "ssoSuper" ? quota : -1));
+        const heavyQuota = Number.isFinite(heavyQuotaRaw) && heavyQuotaRaw >= 0 ? Math.floor(heavyQuotaRaw) : -1;
         const note = typeof it === "string" ? "" : String((it as any)?.note ?? "");
 
         const status = statusRaw === "invalid" ? "expired" : "active";
         const cooldownUntil = statusRaw === "cooling" ? now + 60 * 60 * 1000 : null;
 
         const remaining = quota >= 0 ? quota : -1;
-        const heavy = tokenType === "ssoSuper" ? remaining : -1;
+        const heavy = tokenType === "ssoSuper" ? heavyQuota : -1;
 
         stmts.push(
           c.env.DB.prepare(
@@ -984,6 +997,8 @@ adminRoutes.post("/api/v1/admin/keys/update", requireAdminAuth, async (c) => {
     const body = (await c.req.json()) as any;
     const key = String(body?.key ?? "").trim();
     if (!key) return c.json(jsonError("Missing key", "MISSING_KEY"), 400);
+    const existed = await dbFirst<{ key: string }>(c.env.DB, "SELECT key FROM api_keys WHERE key = ?", [key]);
+    if (!existed) return c.json(jsonError("Key not found", "NOT_FOUND"), 404);
 
     if (body?.name !== undefined) {
       const name = String(body.name ?? "").trim();
