@@ -9,6 +9,12 @@ import { uploadImage } from "../grok/upload";
 import { getDynamicHeaders } from "../grok/headers";
 import { createMediaPost, createPost } from "../grok/create";
 import { createOpenAiStreamFromGrokNdjson, parseOpenAiFromGrokNdjson } from "../grok/processor";
+import {
+  IMAGE_METHOD_IMAGINE_WS_EXPERIMENTAL,
+  generateImagineWs,
+  resolveImageGenerationMethod,
+  sendExperimentalImageEditRequest,
+} from "../grok/imagineExperimental";
 import { addRequestLog } from "../repo/logs";
 import { applyCooldown, recordTokenFailure, selectBestToken } from "../repo/tokens";
 import type { ApiAuthInfo } from "../auth";
@@ -70,6 +76,15 @@ function parseIntSafe(v: string | undefined, fallback: number): number {
 
 function quotaError(bucket: string): Record<string, unknown> {
   return openAiError(`Daily quota exceeded: ${bucket}`, "daily_quota_exceeded");
+}
+
+function isContentModerationMessage(message: string): boolean {
+  const m = String(message || "").toLowerCase();
+  return (
+    m.includes("content moderated") ||
+    m.includes("content-moderated") ||
+    m.includes("wke=grok:content-moderated")
+  );
 }
 
 async function enforceQuota(args: {
@@ -534,6 +549,158 @@ async function runImageStreamCall(args: {
   });
 }
 
+function imageGenerationMethod(settingsBundle: Awaited<ReturnType<typeof getSettings>>) {
+  return resolveImageGenerationMethod(settingsBundle.grok.image_generation_method);
+}
+
+async function collectExperimentalGenerationImages(args: {
+  prompt: string;
+  n: number;
+  cookie: string;
+  settings: Awaited<ReturnType<typeof getSettings>>["grok"];
+  responseFormat: ImageResponseFormat;
+  baseUrl: string;
+}): Promise<string[]> {
+  const calls = Math.ceil(Math.max(1, args.n) / 4);
+  const tasks = Array.from({ length: calls }, (_, i) => {
+    const alreadyPlanned = i * 4;
+    const chunkN = Math.max(1, Math.min(4, args.n - alreadyPlanned));
+    return generateImagineWs({
+      prompt: args.prompt,
+      n: chunkN,
+      cookie: args.cookie,
+      settings: args.settings,
+    });
+  });
+
+  const settled = await Promise.allSettled(tasks);
+  const rawUrls: string[] = [];
+  for (const item of settled) {
+    if (item.status === "fulfilled") rawUrls.push(...item.value);
+  }
+  if (!rawUrls.length) {
+    const firstRejected = settled.find(
+      (item): item is PromiseRejectedResult => item.status === "rejected",
+    );
+    if (firstRejected) throw firstRejected.reason;
+    throw new Error("Experimental imagine websocket returned no images");
+  }
+
+  const converted = await Promise.all(
+    rawUrls.map((rawUrl) =>
+      convertRawUrlByFormat(rawUrl, args.responseFormat, {
+        baseUrl: args.baseUrl,
+        cookie: args.cookie,
+        settings: args.settings,
+      }),
+    ),
+  );
+  return converted.filter(Boolean);
+}
+
+async function runExperimentalImageEditCall(args: {
+  prompt: string;
+  fileUris: string[];
+  cookie: string;
+  settings: Awaited<ReturnType<typeof getSettings>>["grok"];
+  responseFormat: ImageResponseFormat;
+  baseUrl: string;
+}): Promise<string[]> {
+  const upstream = await sendExperimentalImageEditRequest({
+    prompt: args.prompt,
+    fileUris: args.fileUris,
+    cookie: args.cookie,
+    settings: args.settings,
+  });
+  const rawUrls = await collectImageUrls(upstream);
+  const converted = await Promise.all(
+    rawUrls.map((rawUrl) =>
+      convertRawUrlByFormat(rawUrl, args.responseFormat, {
+        baseUrl: args.baseUrl,
+        cookie: args.cookie,
+        settings: args.settings,
+      }),
+    ),
+  );
+  return converted.filter(Boolean);
+}
+
+function createSyntheticImageEventStream(args: {
+  selected: string[];
+  responseField: ImageResponseFormat;
+  onFinish?: (result: { status: number; duration: number }) => Promise<void> | void;
+}): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const startedAt = Date.now();
+      try {
+        let emitted = false;
+        for (let i = 0; i < args.selected.length; i++) {
+          const value = args.selected[i];
+          if (!value || value === "error") continue;
+          emitted = true;
+
+          controller.enqueue(
+            encoder.encode(
+              buildImageSse("image_generation.partial_image", {
+                type: "image_generation.partial_image",
+                [args.responseField]: "",
+                index: i,
+                progress: 100,
+              }),
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              buildImageSse("image_generation.completed", {
+                type: "image_generation.completed",
+                [args.responseField]: value,
+                index: i,
+                usage: {
+                  total_tokens: 50,
+                  input_tokens: 25,
+                  output_tokens: 25,
+                  input_tokens_details: { text_tokens: 5, image_tokens: 20 },
+                },
+              }),
+            ),
+          );
+        }
+
+        if (!emitted) {
+          controller.enqueue(
+            encoder.encode(
+              buildImageSse("image_generation.completed", {
+                type: "image_generation.completed",
+                [args.responseField]: "error",
+                index: 0,
+                usage: {
+                  total_tokens: 0,
+                  input_tokens: 0,
+                  output_tokens: 0,
+                  input_tokens_details: { text_tokens: 0, image_tokens: 0 },
+                },
+              }),
+            ),
+          );
+        }
+
+        if (args.onFinish) {
+          await args.onFinish({ status: 200, duration: (Date.now() - startedAt) / 1000 });
+        }
+        controller.close();
+      } catch (e) {
+        if (args.onFinish) {
+          await args.onFinish({ status: 500, duration: (Date.now() - startedAt) / 1000 });
+        }
+        controller.error(e);
+      }
+    },
+  });
+}
+
 function streamHeaders(): Record<string, string> {
   return {
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -636,6 +803,25 @@ function parseResponseFormatOrError(raw: unknown, defaultMode: string) {
     return { error: { message: invalidResponseFormatMessage(), code: "invalid_response_format" } };
   }
   return { value: resolved };
+}
+
+function resolveImageResponseFormatByMethodOrError(
+  raw: unknown,
+  defaultMode: string,
+  imageMethod: ReturnType<typeof resolveImageGenerationMethod>,
+) {
+  const missing =
+    raw === undefined ||
+    raw === null ||
+    (typeof raw === "string" && raw.trim().length === 0);
+  const normalizedDefault = String(defaultMode || "url").trim().toLowerCase();
+  const effectiveDefault =
+    missing &&
+    imageMethod === IMAGE_METHOD_IMAGINE_WS_EXPERIMENTAL &&
+    normalizedDefault === "url"
+      ? "b64_json"
+      : defaultMode;
+  return parseResponseFormatOrError(raw, effectiveDefault);
 }
 
 openAiRoutes.get("/models", async (c) => {
@@ -904,9 +1090,11 @@ openAiRoutes.post("/images/generations", async (c) => {
     }
 
     const settingsBundle = await getSettings(c.env);
-    const parsedResponseFormat = parseResponseFormatOrError(
+    const imageMethod = imageGenerationMethod(settingsBundle);
+    const parsedResponseFormat = resolveImageResponseFormatByMethodOrError(
       body.response_format,
       imageFormatDefault(settingsBundle),
+      imageMethod,
     );
     if ("error" in parsedResponseFormat) {
       return c.json(
@@ -929,6 +1117,45 @@ openAiRoutes.post("/images/generations", async (c) => {
     if (!quota.ok) return quota.resp;
 
     if (stream) {
+      if (imageMethod === IMAGE_METHOD_IMAGINE_WS_EXPERIMENTAL) {
+        const experimentalToken = await selectBestToken(c.env.DB, requestedModel);
+        if (experimentalToken) {
+          const experimentalCookie = buildCookie(experimentalToken.token, cf);
+          try {
+            const allImages = await collectExperimentalGenerationImages({
+              prompt: imageCallPrompt("generation", prompt),
+              n,
+              cookie: experimentalCookie,
+              settings: settingsBundle.grok,
+              responseFormat,
+              baseUrl,
+            });
+            const selected = pickImageResults(allImages, n);
+            const streamBody = createSyntheticImageEventStream({
+              selected,
+              responseField,
+              onFinish: async ({ status, duration }) => {
+                await addRequestLog(c.env.DB, {
+                  ip,
+                  model: requestedModel,
+                  duration: Number(duration.toFixed(2)),
+                  status,
+                  key_name: keyName,
+                  token_suffix: getTokenSuffix(experimentalToken.token),
+                  error: status === 200 ? "" : "stream_error",
+                });
+              },
+            });
+            return new Response(streamBody, { status: 200, headers: streamHeaders() });
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            await recordTokenFailure(c.env.DB, experimentalToken.token, 500, msg.slice(0, 200));
+            await applyCooldown(c.env.DB, experimentalToken.token, 500);
+            console.warn("Experimental image stream failed, fallback to legacy:", msg);
+          }
+        }
+      }
+
       const chosen = await selectBestToken(c.env.DB, requestedModel);
       if (!chosen) return c.json(openAiError("No available token", "NO_AVAILABLE_TOKEN"), 503);
       const cookie = buildCookie(chosen.token, cf);
@@ -954,6 +1181,9 @@ openAiRoutes.post("/images/generations", async (c) => {
           tokenSuffix: getTokenSuffix(chosen.token),
           error: txt.slice(0, 200),
         });
+        if (isContentModerationMessage(txt)) {
+          return c.json(openAiError(txt.slice(0, 500), "content_policy_violation"), 400);
+        }
         return c.json(openAiError(`Upstream ${upstream.status}`, "upstream_error"), 500);
       }
 
@@ -977,6 +1207,40 @@ openAiRoutes.post("/images/generations", async (c) => {
         },
       });
       return new Response(streamBody, { status: 200, headers: streamHeaders() });
+    }
+
+    if (imageMethod === IMAGE_METHOD_IMAGINE_WS_EXPERIMENTAL) {
+      const experimentalToken = await selectBestToken(c.env.DB, requestedModel);
+      if (experimentalToken) {
+        const experimentalCookie = buildCookie(experimentalToken.token, cf);
+        try {
+          const urls = await collectExperimentalGenerationImages({
+            prompt: imageCallPrompt("generation", prompt),
+            n,
+            cookie: experimentalCookie,
+            settings: settingsBundle.grok,
+            responseFormat,
+            baseUrl,
+          });
+          const selected = pickImageResults(urls, n);
+          await recordImageLog({
+            env: c.env,
+            ip,
+            model: requestedModel,
+            start,
+            keyName,
+            status: 200,
+            tokenSuffix: getTokenSuffix(experimentalToken.token),
+            error: "",
+          });
+          return c.json(buildImageJsonPayload(responseField, selected));
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          await recordTokenFailure(c.env.DB, experimentalToken.token, 500, msg.slice(0, 200));
+          await applyCooldown(c.env.DB, experimentalToken.token, 500);
+          console.warn("Experimental image generation failed, fallback to legacy:", msg);
+        }
+      }
     }
 
     const calls = Math.ceil(n / 2);
@@ -1016,6 +1280,19 @@ openAiRoutes.post("/images/generations", async (c) => {
 
     return c.json(buildImageJsonPayload(responseField, selected));
   } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    if (isContentModerationMessage(message)) {
+      await recordImageLog({
+        env: c.env,
+        ip,
+        model: requestedModel || "image",
+        start,
+        keyName,
+        status: 400,
+        error: message,
+      });
+      return c.json(openAiError(message, "content_policy_violation"), 400);
+    }
     await recordImageLog({
       env: c.env,
       ip,
@@ -1023,9 +1300,9 @@ openAiRoutes.post("/images/generations", async (c) => {
       start,
       keyName,
       status: 500,
-      error: e instanceof Error ? e.message : String(e),
+      error: message,
     });
-    return c.json(openAiError(e instanceof Error ? e.message : "Internal error", "internal_error"), 500);
+    return c.json(openAiError(message || "Internal error", "internal_error"), 500);
   }
 });
 
@@ -1060,9 +1337,11 @@ openAiRoutes.post("/images/edits", async (c) => {
     }
 
     const settingsBundle = await getSettings(c.env);
-    const parsedResponseFormat = parseResponseFormatOrError(
+    const imageMethod = imageGenerationMethod(settingsBundle);
+    const parsedResponseFormat = resolveImageResponseFormatByMethodOrError(
       form.get("response_format"),
       imageFormatDefault(settingsBundle),
+      imageMethod,
     );
     if ("error" in parsedResponseFormat) {
       return c.json(
@@ -1089,6 +1368,7 @@ openAiRoutes.post("/images/edits", async (c) => {
     const cookie = buildCookie(chosen.token, cf);
 
     const fileIds: string[] = [];
+    const fileUris: string[] = [];
     for (const file of files) {
       const bytes = await file.arrayBuffer();
       if (bytes.byteLength <= 0) {
@@ -1109,9 +1389,47 @@ openAiRoutes.post("/images/edits", async (c) => {
       const dataUrl = `data:${mime};base64,${arrayBufferToBase64(bytes)}`;
       const uploaded = await uploadImage(dataUrl, cookie, settingsBundle.grok);
       if (uploaded.fileId) fileIds.push(uploaded.fileId);
+      if (uploaded.fileUri) fileUris.push(uploaded.fileUri);
     }
 
     if (stream) {
+      if (imageMethod === IMAGE_METHOD_IMAGINE_WS_EXPERIMENTAL) {
+        try {
+          const upstream = await sendExperimentalImageEditRequest({
+            prompt: imageCallPrompt("edit", prompt),
+            fileUris,
+            cookie,
+            settings: settingsBundle.grok,
+          });
+
+          const streamBody = createImageEventStream({
+            upstream,
+            responseFormat,
+            baseUrl,
+            cookie,
+            settings: settingsBundle.grok,
+            n,
+            onFinish: async ({ status, duration }) => {
+              await addRequestLog(c.env.DB, {
+                ip,
+                model: requestedModel,
+                duration: Number(duration.toFixed(2)),
+                status,
+                key_name: keyName,
+                token_suffix: getTokenSuffix(chosen.token),
+                error: status === 200 ? "" : "stream_error",
+              });
+            },
+          });
+          return new Response(streamBody, { status: 200, headers: streamHeaders() });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          await recordTokenFailure(c.env.DB, chosen.token, 500, msg.slice(0, 200));
+          await applyCooldown(c.env.DB, chosen.token, 500);
+          console.warn("Experimental image edit stream failed, fallback to legacy:", msg);
+        }
+      }
+
       const upstream = await runImageStreamCall({
         requestModel: requestedModel,
         prompt: imageCallPrompt("edit", prompt),
@@ -1133,6 +1451,9 @@ openAiRoutes.post("/images/edits", async (c) => {
           tokenSuffix: getTokenSuffix(chosen.token),
           error: txt.slice(0, 200),
         });
+        if (isContentModerationMessage(txt)) {
+          return c.json(openAiError(txt.slice(0, 500), "content_policy_violation"), 400);
+        }
         return c.json(openAiError(`Upstream ${upstream.status}`, "upstream_error"), 500);
       }
 
@@ -1156,6 +1477,42 @@ openAiRoutes.post("/images/edits", async (c) => {
         },
       });
       return new Response(streamBody, { status: 200, headers: streamHeaders() });
+    }
+
+    if (imageMethod === IMAGE_METHOD_IMAGINE_WS_EXPERIMENTAL) {
+      try {
+        const calls = Math.ceil(n / 2);
+        const urlsNested = await mapLimit(Array.from({ length: calls }), 3, async () =>
+          runExperimentalImageEditCall({
+            prompt: imageCallPrompt("edit", prompt),
+            fileUris,
+            cookie,
+            settings: settingsBundle.grok,
+            responseFormat,
+            baseUrl,
+          }),
+        );
+        const urls = urlsNested.flat().filter(Boolean);
+        if (!urls.length) throw new Error("Experimental image edit returned no images");
+        const selected = pickImageResults(urls, n);
+
+        await recordImageLog({
+          env: c.env,
+          ip,
+          model: requestedModel,
+          start,
+          keyName,
+          status: 200,
+          tokenSuffix: getTokenSuffix(chosen.token),
+          error: "",
+        });
+        return c.json(buildImageJsonPayload(responseField, selected));
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        await recordTokenFailure(c.env.DB, chosen.token, 500, msg.slice(0, 200));
+        await applyCooldown(c.env.DB, chosen.token, 500);
+        console.warn("Experimental image edit failed, fallback to legacy:", msg);
+      }
     }
 
     const calls = Math.ceil(n / 2);
@@ -1186,6 +1543,19 @@ openAiRoutes.post("/images/edits", async (c) => {
 
     return c.json(buildImageJsonPayload(responseField, selected));
   } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    if (isContentModerationMessage(message)) {
+      await recordImageLog({
+        env: c.env,
+        ip,
+        model: requestedModel || "image",
+        start,
+        keyName,
+        status: 400,
+        error: message,
+      });
+      return c.json(openAiError(message, "content_policy_violation"), 400);
+    }
     await recordImageLog({
       env: c.env,
       ip,
@@ -1193,9 +1563,9 @@ openAiRoutes.post("/images/edits", async (c) => {
       start,
       keyName,
       status: 500,
-      error: e instanceof Error ? e.message : String(e),
+      error: message,
     });
-    return c.json(openAiError(e instanceof Error ? e.message : "Internal error", "internal_error"), 500);
+    return c.json(openAiError(message || "Internal error", "internal_error"), 500);
   }
 });
 
